@@ -18,6 +18,7 @@ void setup()
 {
     Serial.begin(115200);
     NimBLEDevice::init("NIMBLE OTA");
+    NimBLEDevice::setMTU(517);
     NimBLEServer* pServer = NimBLEOta::createServer();
     pServer->setCallbacks(new NimBleOtaServerCallbacks());
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();

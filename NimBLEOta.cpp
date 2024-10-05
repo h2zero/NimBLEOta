@@ -7,7 +7,7 @@
 #define OTA_BAR_UUID (uint16_t)0x8021
 #define COMMAND_UUID (uint16_t)0x8022
 #define CUSTOMER_UUID (uint16_t)0x8023
-#define BUF_LENGTH 4098
+#define BUF_LENGTH 4096
 #define OTA_IDX_NB 4
 #define START_OTA_CMD 0x0001
 #define STOP_OTA_CMD 0x0002
@@ -17,10 +17,13 @@
 #define SIGN_ERROR 0x0003
 #define CRC_ERROR 0x0001
 #define INDEX_ERROR 0x0002
+#define OTA_FW_SUCCESS 0x0000
+#define LEN_ERROR 0x0003
 #define START_ERROR 0x0005
+#define FW_ACK_LENGTH 20
 #define CMD_ACK_LENGTH 20
 #define CMD_ACK_BASE {ACK_OTA_CMD, (ACK_OTA_CMD >> 8) & 0xff, 0x00, 0x00, OTA_REJECT, (OTA_REJECT >> 8) & 0xff, \
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 static uint32_t ota_total_len = 0;
 static uint32_t ota_block_size = BUF_LENGTH;
@@ -32,6 +35,7 @@ static uint32_t fw_buf_offset = 0;
 static esp_ota_handle_t out_handle = 0;
 static esp_partition_t partition;
 static ble_gap_conn_desc otaClientInfo;
+static uint32_t recv_len = 0;
 
 static const char *LOG_TAG = "NimBLEOta";
 
@@ -56,34 +60,46 @@ static uint16_t crc16_ccitt(const uint8_t *buf, int len)
 }
 
 class RecvFwCallbacks : public NimBLECharacteristicCallbacks {
-    uint32_t recv_len = 0;
+    void onWrite(NimBLECharacteristic * pCharacteristic, ble_gap_conn_desc* desc) override {
+        if (ble_addr_cmp(&otaClientInfo.peer_id_addr, &desc->peer_id_addr) != 0) {
+            NIMBLE_LOGE(LOG_TAG, "Received write from unknown client - ignored");
+            return;
+        }
 
-    void onWrite(NimBLECharacteristic *pCharacteristic) {
         const uint8_t *data = pCharacteristic->getValue();
         auto data_len = pCharacteristic->getValue().length();
-        uint8_t cmd_ack[CMD_ACK_LENGTH] = CMD_ACK_BASE;
-        uint16_t crc16 = data[18] | (data[19] << 8);
+        uint8_t cmd_ack[FW_ACK_LENGTH]{0};
+        uint16_t crc16 = 0;
         uint32_t write_len = 0;
+        cmd_ack[0] = data[0];
+        cmd_ack[1] = data[1];
 
         if (!ota_started) {
             NIMBLE_LOGE(LOG_TAG, "ota not started");
+            cmd_ack[2] = LEN_ERROR;
+            cmd_ack[3] = (LEN_ERROR >> 8) & 0xff;
+            cmd_ack[4] = cur_sector;
+            cmd_ack[5] = (cur_sector >> 8) & 0xff;
+            crc16 = crc16_ccitt(cmd_ack, 18);
+            cmd_ack[18] = crc16;
+            cmd_ack[19] = (crc16 >> 8) & 0xff;
+            pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
+            pCharacteristic->indicate();
+            return;
         }
 
-        if ((data[0] + (data[1] * 256)) != cur_sector) {
+        if (data[0] + (data[1] * 256) != cur_sector) {
             // sector error
             if ((data[0] == 0xff) && (data[1] == 0xff)) {
                 // last sector
-                NIMBLE_LOGD(LOG_TAG, "Last sector");
+                NIMBLE_LOGI(LOG_TAG, "Last sector received");
             } else {
                 // sector error
-                NIMBLE_LOGE(LOG_TAG, "%s - sector index error, cur: %" PRIu32 ", recv: %d", __func__,
-                        cur_sector, (data[0] + (data[1] * 256)));
-                cmd_ack[0] = data[0];
-                cmd_ack[1] = data[1];
-                cmd_ack[2] = 0x02; //sector index error
-                cmd_ack[3] = 0x00;
-                cmd_ack[4] = cur_sector & 0xff;
-                cmd_ack[5] = (cur_sector & 0xff00) >> 8;
+                NIMBLE_LOGE(LOG_TAG, "sector index error, cur: %" PRIu32 ", recv: %d", cur_sector, (data[0] + (data[1] * 256)));
+                cmd_ack[2] = INDEX_ERROR;
+                cmd_ack[3] = (INDEX_ERROR >> 8) & 0xff;
+                cmd_ack[4] = cur_sector;
+                cmd_ack[5] = (cur_sector >> 8) & 0xff;
                 crc16 = crc16_ccitt(cmd_ack, 18);
                 cmd_ack[18] = crc16 & 0xff;
                 cmd_ack[19] = (crc16 & 0xff00) >> 8;
@@ -98,9 +114,7 @@ class RecvFwCallbacks : public NimBLECharacteristicCallbacks {
                 NIMBLE_LOGD(LOG_TAG, "last packet");
                 goto write_ota_data;
             } else { // packet seq error
-                NIMBLE_LOGE(LOG_TAG, "%s - packet index error, cur: %" PRIu32 ", recv: %d", __func__,
-                        cur_packet, data[2]);
-                goto OTA_ERROR;
+                NIMBLE_LOGE(LOG_TAG, "packet sequence error, cur: %" PRIu32 ", recv: %d", cur_packet, data[2]);
             }
         }
 
@@ -108,22 +122,22 @@ class RecvFwCallbacks : public NimBLECharacteristicCallbacks {
         memcpy(fw_buf + fw_buf_offset, data + 3, data_len - 3);
         fw_buf_offset += data_len - 3;
 
-        NIMBLE_LOGD(LOG_TAG, "DEBUG: Sector:%" PRIu32 ", total length:%" PRIu32 ", length:%d", cur_sector,
+        NIMBLE_LOGD(LOG_TAG, "Sector:%" PRIu32 ", total length:%" PRIu32 ", length:%d", cur_sector,
                 fw_buf_offset, data_len - 3);
 
         if (data[2] == 0xff) {
             cur_packet = 0;
             cur_sector++;
-            NIMBLE_LOGD(LOG_TAG, "DEBUG: recv %" PRIu32 " sector", cur_sector);
+            NIMBLE_LOGI(LOG_TAG, "received sector %" PRIu32, cur_sector);
             goto sector_end;
         } else {
-            NIMBLE_LOGD(LOG_TAG, "DEBUG: wait next packet");
+            NIMBLE_LOGD(LOG_TAG, "waiting for next packet");
             cur_packet++;
         }
         return;
 
     sector_end:
-        write_len = std::min<uint32_t>(4096, fw_buf_offset);
+        write_len = std::min<size_t>(ota_block_size, fw_buf_offset);
         if (esp_ota_write(out_handle, (const void *)fw_buf, write_len) != ESP_OK) {
             NIMBLE_LOGE(LOG_TAG, "esp_ota_write failed!\r\n");
             goto OTA_ERROR;
@@ -141,26 +155,33 @@ class RecvFwCallbacks : public NimBLECharacteristicCallbacks {
                 goto OTA_ERROR;
             }
 
+            NIMBLE_LOGI(LOG_TAG, "OTA update complete");
+            ble_npl_time_t ticks;
+            ble_npl_time_delay(ble_npl_time_ms_to_ticks(2000, &ticks));
             esp_restart();
         }
 
         fw_buf_offset = 0;
         memset(fw_buf, 0x0, ota_block_size);
 
-        cmd_ack[0] = data[0];
-        cmd_ack[1] = data[1];
-        cmd_ack[2] = 0x00; //success
-        cmd_ack[3] = 0x00;
+        cmd_ack[2] = OTA_FW_SUCCESS;
+        cmd_ack[3] = (OTA_FW_SUCCESS >> 8) & 0xff;
+        cmd_ack[4] = cur_sector;
+        cmd_ack[5] = (cur_sector >> 8) & 0xff;
         crc16 = crc16_ccitt(cmd_ack, 18);
-        cmd_ack[18] = crc16 & 0xff;
-        cmd_ack[19] = (crc16 & 0xff00) >> 8;
+        cmd_ack[18] = crc16;
+        cmd_ack[19] = (crc16 >> 8) & 0xff;
         pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
         pCharacteristic->indicate();
         return;
 
     OTA_ERROR:
         NIMBLE_LOGE(LOG_TAG, "OTA failed");
-        esp_ota_abort(out_handle);
+        NimBLEOta::abortOta();
+    }
+
+    void onSubscribe(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) override {
+        NIMBLE_LOGI(LOG_TAG, "FW Subscribe client conn_handle: %d, subscribed: %s", desc->conn_handle, subValue ? "true" : "false");
     }
 };
 
@@ -247,15 +268,9 @@ class CommandCallbacks : public NimBLECharacteristicCallbacks {
                 if (!ota_started) {
                     NIMBLE_LOGE(LOG_TAG, "ota not started");
                 } else {
-                    if (fw_buf != nullptr) {
-                        free(fw_buf);
-                        fw_buf = nullptr;
-                    }
-
+                    NimBLEOta::abortOta();
                     cmd_ack[4] = OTA_ACCEPT;
                     cmd_ack[5] = (OTA_ACCEPT >> 8) & 0xff;
-                    ota_started = false;
-                    esp_ota_abort(out_handle);
                 }
             }
         } else {
@@ -272,8 +287,10 @@ class CommandCallbacks : public NimBLECharacteristicCallbacks {
 
     void onSubscribe(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) override {
         otaClientInfo = *desc;
-        NIMBLE_LOGI(LOG_TAG, "Subscribe client conn_handle: %d, subscribed: %s", desc->conn_handle, subValue ? "true" : "false");
-        // TODO handle disconnect/unsubscribe
+        NIMBLE_LOGI(LOG_TAG, "CMD Subscribe client conn_handle: %d, subscribed: %s", desc->conn_handle, subValue ? "true" : "false");
+        if (!subValue && recv_len < ota_total_len) { // Disconnected, abort
+            NimBLEOta::abortOta();
+        }
     }
 };
 
@@ -310,4 +327,18 @@ NimBLEServer *NimBLEOta::createServer()
 NimBLEUUID NimBLEOta::getServiceUUID()
 {
     return NimBLEUUID{BLE_OTA_SERVICE_UUID};
+}
+
+void NimBLEOta::abortOta() {
+    if (fw_buf != nullptr) {
+        free(fw_buf);
+        fw_buf = nullptr;
+    }
+
+    recv_len = 0;
+    fw_buf_offset = 0;
+    cur_packet = 0;
+    cur_sector = 0;
+    esp_ota_abort(out_handle);
+    ota_started = false;
 }
