@@ -1,13 +1,12 @@
 #include "NimBLEDevice.h"
 #include "NimBLEOta.h"
-#include "esp_ota_ops.h"
 
 #define BLE_OTA_SERVICE_UUID (uint16_t)0x8018
 #define RECV_FW_UUID (uint16_t)0x8020
 #define OTA_BAR_UUID (uint16_t)0x8021
 #define COMMAND_UUID (uint16_t)0x8022
 #define CUSTOMER_UUID (uint16_t)0x8023
-#define BUF_LENGTH 4096
+#define OTA_BLOCK_SIZE 4096
 #define OTA_IDX_NB 4
 #define START_OTA_CMD 0x0001
 #define STOP_OTA_CMD 0x0002
@@ -25,22 +24,9 @@
 #define CMD_ACK_BASE {ACK_OTA_CMD, (ACK_OTA_CMD >> 8) & 0xff, 0x00, 0x00, OTA_REJECT, (OTA_REJECT >> 8) & 0xff, \
                       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
-static uint32_t ota_total_len = 0;
-static uint32_t ota_block_size = BUF_LENGTH;
-static uint8_t *fw_buf = nullptr;
-static bool ota_started = false;
-static uint32_t cur_sector = 0;
-static uint32_t cur_packet = 0;
-static uint32_t fw_buf_offset = 0;
-static esp_ota_handle_t out_handle = 0;
-static esp_partition_t partition;
-static ble_gap_conn_desc otaClientInfo;
-static uint32_t recv_len = 0;
-
 static const char *LOG_TAG = "NimBLEOta";
 
-static uint16_t crc16_ccitt(const uint8_t *buf, int len)
-{
+static uint16_t crc16_ccitt(const uint8_t *buf, int len) {
     uint16_t crc16 = 0;
     int32_t i;
 
@@ -59,286 +45,274 @@ static uint16_t crc16_ccitt(const uint8_t *buf, int len)
     return crc16;
 }
 
-class RecvFwCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic * pCharacteristic, ble_gap_conn_desc* desc) override {
-        if (ble_addr_cmp(&otaClientInfo.peer_id_addr, &desc->peer_id_addr) != 0) {
-            NIMBLE_LOGE(LOG_TAG, "Received write from unknown client - ignored");
-            return;
-        }
+void NimBLEOta::NimBLEOtaCharacteristicCallbacks::firmwareOnWrite(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc) {
+    if (ble_addr_cmp(&m_pOta->m_client.peer_id_addr, &desc->peer_id_addr) != 0) {
+        NIMBLE_LOGE(LOG_TAG, "Received write from unknown client - ignored");
+        return;
+    }
 
-        const uint8_t *data = pCharacteristic->getValue();
-        auto data_len = pCharacteristic->getValue().length();
-        uint8_t cmd_ack[FW_ACK_LENGTH]{0};
-        uint16_t crc16 = 0;
-        uint32_t write_len = 0;
-        cmd_ack[0] = data[0];
-        cmd_ack[1] = data[1];
+    const uint8_t *data = pCharacteristic->getValue();
+    auto data_len = pCharacteristic->getValue().length();
+    uint8_t cmd_ack[FW_ACK_LENGTH]{0};
+    uint16_t crc16 = 0;
+    uint32_t write_len = 0;
+    cmd_ack[0] = data[0];
+    cmd_ack[1] = data[1];
 
-        if (!ota_started) {
-            NIMBLE_LOGE(LOG_TAG, "ota not started");
-            cmd_ack[2] = LEN_ERROR;
-            cmd_ack[3] = (LEN_ERROR >> 8) & 0xff;
-            cmd_ack[4] = cur_sector;
-            cmd_ack[5] = (cur_sector >> 8) & 0xff;
+    if (!m_pOta->isInProgress()) {
+        NIMBLE_LOGE(LOG_TAG, "ota not started");
+        cmd_ack[2] = LEN_ERROR;
+        cmd_ack[3] = (LEN_ERROR >> 8) & 0xff;
+        cmd_ack[4] = m_pOta->m_sector;
+        cmd_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
+        crc16 = crc16_ccitt(cmd_ack, 18);
+        cmd_ack[18] = crc16;
+        cmd_ack[19] = (crc16 >> 8) & 0xff;
+        pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
+        pCharacteristic->indicate();
+        return;
+    }
+
+    if (data[0] + (data[1] * 256) != m_pOta->m_sector) {
+        // sector error
+        if ((data[0] == 0xff) && (data[1] == 0xff)) {
+            // last sector
+            NIMBLE_LOGI(LOG_TAG, "Last sector received");
+        } else {
+            // sector error
+            NIMBLE_LOGE(LOG_TAG, "sector index error, cur: %" PRIu32 ", recv: %d", m_pOta->m_sector, (data[0] + (data[1] * 256)));
+            cmd_ack[2] = INDEX_ERROR;
+            cmd_ack[3] = (INDEX_ERROR >> 8) & 0xff;
+            cmd_ack[4] = m_pOta->m_sector;
+            cmd_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
             crc16 = crc16_ccitt(cmd_ack, 18);
-            cmd_ack[18] = crc16;
-            cmd_ack[19] = (crc16 >> 8) & 0xff;
+            cmd_ack[18] = crc16 & 0xff;
+            cmd_ack[19] = (crc16 & 0xff00) >> 8;
             pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
             pCharacteristic->indicate();
             return;
         }
+    }
 
-        if (data[0] + (data[1] * 256) != cur_sector) {
-            // sector error
-            if ((data[0] == 0xff) && (data[1] == 0xff)) {
-                // last sector
-                NIMBLE_LOGI(LOG_TAG, "Last sector received");
-            } else {
-                // sector error
-                NIMBLE_LOGE(LOG_TAG, "sector index error, cur: %" PRIu32 ", recv: %d", cur_sector, (data[0] + (data[1] * 256)));
-                cmd_ack[2] = INDEX_ERROR;
-                cmd_ack[3] = (INDEX_ERROR >> 8) & 0xff;
-                cmd_ack[4] = cur_sector;
-                cmd_ack[5] = (cur_sector >> 8) & 0xff;
-                crc16 = crc16_ccitt(cmd_ack, 18);
-                cmd_ack[18] = crc16 & 0xff;
-                cmd_ack[19] = (crc16 & 0xff00) >> 8;
-                pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
-                pCharacteristic->indicate();
-                return;
-            }
+    if (data[2] != m_pOta->m_packet) { // packet seq error
+        if (data[2] == 0xff) { // last packet
+            NIMBLE_LOGD(LOG_TAG, "last packet");
+            goto write_ota_data;
+        } else { // packet seq error
+            NIMBLE_LOGE(LOG_TAG, "packet sequence error, cur: %" PRIu32 ", recv: %d", m_pOta->m_packet, data[2]);
         }
+    }
 
-        if (data[2] != cur_packet) { // packet seq error
-            if (data[2] == 0xff) { // last packet
-                NIMBLE_LOGD(LOG_TAG, "last packet");
-                goto write_ota_data;
-            } else { // packet seq error
-                NIMBLE_LOGE(LOG_TAG, "packet sequence error, cur: %" PRIu32 ", recv: %d", cur_packet, data[2]);
-            }
-        }
+write_ota_data:
+    memcpy(m_pOta->m_pBuf + m_pOta->m_offset, data + 3, data_len - 3);
+    m_pOta->m_offset += data_len - 3;
 
-    write_ota_data:
-        memcpy(fw_buf + fw_buf_offset, data + 3, data_len - 3);
-        fw_buf_offset += data_len - 3;
+    NIMBLE_LOGD(LOG_TAG, "Sector:%" PRIu32 ", total length:%" PRIu32 ", length:%d", m_pOta->m_sector, m_pOta->m_offset, data_len - 3);
 
-        NIMBLE_LOGD(LOG_TAG, "Sector:%" PRIu32 ", total length:%" PRIu32 ", length:%d", cur_sector,
-                fw_buf_offset, data_len - 3);
+    if (data[2] == 0xff) {
+        m_pOta->m_packet = 0;
+        m_pOta->m_sector++;
+        NIMBLE_LOGI(LOG_TAG, "received sector %" PRIu32, m_pOta->m_sector);
+        goto sector_end;
+    } else {
+        NIMBLE_LOGD(LOG_TAG, "waiting for next packet");
+        m_pOta->m_packet++;
+    }
+    return;
 
-        if (data[2] == 0xff) {
-            cur_packet = 0;
-            cur_sector++;
-            NIMBLE_LOGI(LOG_TAG, "received sector %" PRIu32, cur_sector);
-            goto sector_end;
-        } else {
-            NIMBLE_LOGD(LOG_TAG, "waiting for next packet");
-            cur_packet++;
-        }
-        return;
+sector_end:
+    write_len = std::min<size_t>(OTA_BLOCK_SIZE, m_pOta->m_offset);
+    if (esp_ota_write(m_pOta->m_writeHandle, (const void *)m_pOta->m_pBuf, write_len) != ESP_OK) {
+        NIMBLE_LOGE(LOG_TAG, "esp_ota_write failed!\r\n");
+        goto OTA_ERROR;
+    }
 
-    sector_end:
-        write_len = std::min<size_t>(ota_block_size, fw_buf_offset);
-        if (esp_ota_write(out_handle, (const void *)fw_buf, write_len) != ESP_OK) {
-            NIMBLE_LOGE(LOG_TAG, "esp_ota_write failed!\r\n");
+    m_pOta->m_recvLen += write_len;
+    if (m_pOta->m_recvLen >= m_pOta->m_fileLen) {
+        if (esp_ota_end(m_pOta->m_writeHandle) != ESP_OK) {
+            NIMBLE_LOGE(LOG_TAG, "esp_ota_end failed!\r\n");
             goto OTA_ERROR;
         }
 
-        recv_len += write_len;
-        if (recv_len >= ota_total_len) {
-            if (esp_ota_end(out_handle) != ESP_OK) {
-                NIMBLE_LOGE(LOG_TAG, "esp_ota_end failed!\r\n");
-                goto OTA_ERROR;
-            }
-
-            if (esp_ota_set_boot_partition(&partition) != ESP_OK) {
-                NIMBLE_LOGE(LOG_TAG, "esp_ota_set_boot_partition failed!\r\n");
-                goto OTA_ERROR;
-            }
-
-            NIMBLE_LOGI(LOG_TAG, "OTA update complete");
-            ble_npl_time_t ticks;
-            ble_npl_time_delay(ble_npl_time_ms_to_ticks(2000, &ticks));
-            esp_restart();
+        if (esp_ota_set_boot_partition(&m_pOta->m_partition) != ESP_OK) {
+            NIMBLE_LOGE(LOG_TAG, "esp_ota_set_boot_partition failed!\r\n");
+            goto OTA_ERROR;
         }
 
-        fw_buf_offset = 0;
-        memset(fw_buf, 0x0, ota_block_size);
+        NIMBLE_LOGI(LOG_TAG, "OTA update complete");
+        ble_npl_time_t ticks;
+        ble_npl_time_delay(ble_npl_time_ms_to_ticks(2000, &ticks));
+        esp_restart();
+    }
 
-        cmd_ack[2] = OTA_FW_SUCCESS;
-        cmd_ack[3] = (OTA_FW_SUCCESS >> 8) & 0xff;
-        cmd_ack[4] = cur_sector;
-        cmd_ack[5] = (cur_sector >> 8) & 0xff;
-        crc16 = crc16_ccitt(cmd_ack, 18);
-        cmd_ack[18] = crc16;
-        cmd_ack[19] = (crc16 >> 8) & 0xff;
-        pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
-        pCharacteristic->indicate();
+    m_pOta->m_offset = 0;
+    memset(m_pOta->m_pBuf, 0x0, OTA_BLOCK_SIZE);
+
+    cmd_ack[2] = OTA_FW_SUCCESS;
+    cmd_ack[3] = (OTA_FW_SUCCESS >> 8) & 0xff;
+    cmd_ack[4] = m_pOta->m_sector;
+    cmd_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
+    crc16 = crc16_ccitt(cmd_ack, 18);
+    cmd_ack[18] = crc16;
+    cmd_ack[19] = (crc16 >> 8) & 0xff;
+    pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
+    pCharacteristic->indicate();
+    return;
+
+OTA_ERROR:
+    NIMBLE_LOGE(LOG_TAG, "OTA failed");
+    m_pOta->abortOta();
+}
+
+void NimBLEOta::NimBLEOtaCharacteristicCallbacks::commandOnWrite(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc) {
+    if (ble_addr_cmp(&m_pOta->m_client.peer_id_addr, &desc->peer_id_addr) != 0) {
+        NIMBLE_LOGE(LOG_TAG, "Received command from unknown client - ignored");
         return;
-
-    OTA_ERROR:
-        NIMBLE_LOGE(LOG_TAG, "OTA failed");
-        NimBLEOta::abortOta();
     }
 
-    void onSubscribe(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) override {
-        NIMBLE_LOGI(LOG_TAG, "FW Subscribe client conn_handle: %d, subscribed: %s", desc->conn_handle, subValue ? "true" : "false");
-    }
-};
+    uint8_t cmd_ack[CMD_ACK_LENGTH] = CMD_ACK_BASE;
+    uint16_t crc16 = 0;
 
-class OtaBarCallbacks : public NimBLECharacteristicCallbacks {
+    if (pCharacteristic->getValue().length() == 20) {
+        const uint8_t *data = pCharacteristic->getValue();
+        uint16_t cmd = data[0] | (data[1] << 8);
+        crc16 = data[18] | (data[19] << 8);
+        cmd_ack[2] = data[0];
+        cmd_ack[3] = data[1];
 
-};
+        if (crc16_ccitt(data, 18) != crc16 || (cmd != START_OTA_CMD && cmd != STOP_OTA_CMD)) {
+            NIMBLE_LOGE(LOG_TAG, "command %s error", cmd == START_OTA_CMD || cmd == STOP_OTA_CMD ? "CRC" : "invalid");
+        } else if (cmd == START_OTA_CMD) {
+            if (m_pOta->isInProgress()) {
+                NIMBLE_LOGE(LOG_TAG, "ota already started");
+            } else {
+                m_pOta->m_fileLen = (data[2]) + (data[3] * 256) + (data[4] * 256 * 256) + (data[5] * 256 * 256 * 256);
+                NIMBLE_LOGI(LOG_TAG, "recv ota start cmd, fw_length = %" PRIu32 "", m_pOta->m_fileLen);
 
-class CommandCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic * pCharacteristic, ble_gap_conn_desc* desc) override {
-        if (ble_addr_cmp(&otaClientInfo.peer_id_addr, &desc->peer_id_addr) != 0) {
-            NIMBLE_LOGE(LOG_TAG, "Received command from unknown client - ignored");
-            return;
-        }
-
-        uint8_t cmd_ack[CMD_ACK_LENGTH] = CMD_ACK_BASE;
-        uint16_t crc16 = 0;
-
-        if (pCharacteristic->getValue().length() == 20) {
-            const uint8_t *data = pCharacteristic->getValue();
-            uint16_t cmd = data[0] | (data[1] << 8);
-            crc16 = data[18] | (data[19] << 8);
-            cmd_ack[2] = data[0];
-            cmd_ack[3] = data[1];
-
-            if (crc16_ccitt(data, 18) != crc16 || (cmd != START_OTA_CMD && cmd != STOP_OTA_CMD)) {
-                NIMBLE_LOGE(LOG_TAG, "command %s error", cmd == START_OTA_CMD || cmd == STOP_OTA_CMD ? "CRC" : "invalid");
-            } else if (cmd == START_OTA_CMD) {
-                if (ota_started) {
-                    NIMBLE_LOGE(LOG_TAG, "ota already started");
+                m_pOta->m_pBuf = (uint8_t *)malloc(OTA_BLOCK_SIZE * sizeof(uint8_t));
+                if (m_pOta->m_pBuf == nullptr) {
+                    NIMBLE_LOGE(LOG_TAG, "%s -  malloc fail", __func__);
+                    goto Done;
                 } else {
-                    ota_total_len = (data[2]) + (data[3] * 256) + (data[4] * 256 * 256) + (data[5] * 256 * 256 * 256);
-                    NIMBLE_LOGI(LOG_TAG, "recv ota start cmd, fw_length = %" PRIu32 "", ota_total_len);
-
-                    fw_buf = (uint8_t *)malloc(ota_block_size * sizeof(uint8_t));
-                    if (fw_buf == nullptr) {
-                        NIMBLE_LOGE(LOG_TAG, "%s -  malloc fail", __func__);
-                        goto Done;
-                    } else {
-                        memset(fw_buf, 0x0, ota_block_size);
-                    }
-
-                    const esp_partition_t *partition_ptr = esp_ota_get_boot_partition();
-                    if (partition_ptr == NULL) {
-                        NIMBLE_LOGE(LOG_TAG, "boot partition NULL!\r\n");
-                        goto Done;
-                    }
-
-                    if (partition_ptr->type != ESP_PARTITION_TYPE_APP) {
-                        NIMBLE_LOGE(LOG_TAG, "esp_current_partition->type != ESP_PARTITION_TYPE_APP\r\n");
-                        goto Done;
-                    }
-
-                    if (partition_ptr->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
-                        partition.subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0;
-                    } else {
-                        const esp_partition_t *next_partition = esp_ota_get_next_update_partition(partition_ptr);
-                        if (next_partition) {
-                            partition.subtype = next_partition->subtype;
-                        } else {
-                            partition.subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0;
-                        }
-                    }
-                    partition.type = ESP_PARTITION_TYPE_APP;
-
-                    partition_ptr = esp_partition_find_first(partition.type, partition.subtype, NULL);
-                    if (partition_ptr == nullptr) {
-                        NIMBLE_LOGE(LOG_TAG, "partition NULL!\r\n");
-                        goto Done;
-                    }
-
-                    memcpy(&partition, partition_ptr, sizeof(esp_partition_t));
-                    if (esp_ota_begin(&partition, OTA_SIZE_UNKNOWN, &out_handle) != ESP_OK) {
-                        NIMBLE_LOGE(LOG_TAG, "esp_ota_begin failed!\r\n");
-                        goto Done;
-                    }
-
-                    cmd_ack[4] = OTA_ACCEPT;
-                    cmd_ack[5] = (OTA_ACCEPT >> 8) & 0xff;
-                    ota_started = true;
-                    NIMBLE_LOGI(LOG_TAG, "ota start success");
+                    memset(m_pOta->m_pBuf, 0x0, OTA_BLOCK_SIZE);
                 }
-            } else if (cmd == STOP_OTA_CMD) {
-                NIMBLE_LOGI(LOG_TAG, "recv ota stop cmd");
-                if (!ota_started) {
-                    NIMBLE_LOGE(LOG_TAG, "ota not started");
+
+                const esp_partition_t *partition_ptr = esp_ota_get_boot_partition();
+                if (partition_ptr == NULL) {
+                    NIMBLE_LOGE(LOG_TAG, "boot partition NULL!\r\n");
+                    goto Done;
+                }
+
+                if (partition_ptr->type != ESP_PARTITION_TYPE_APP) {
+                    NIMBLE_LOGE(LOG_TAG, "esp_current_partition->type != ESP_PARTITION_TYPE_APP\r\n");
+                    goto Done;
+                }
+
+                if (partition_ptr->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+                    m_pOta->m_partition.subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0;
                 } else {
-                    NimBLEOta::abortOta();
-                    cmd_ack[4] = OTA_ACCEPT;
-                    cmd_ack[5] = (OTA_ACCEPT >> 8) & 0xff;
+                    const esp_partition_t *next_partition = esp_ota_get_next_update_partition(partition_ptr);
+                    if (next_partition) {
+                        m_pOta->m_partition.subtype = next_partition->subtype;
+                    } else {
+                        m_pOta->m_partition.subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0;
+                    }
                 }
+                m_pOta->m_partition.type = ESP_PARTITION_TYPE_APP;
+
+                partition_ptr = esp_partition_find_first(m_pOta->m_partition.type, m_pOta->m_partition.subtype, NULL);
+                if (partition_ptr == nullptr) {
+                    NIMBLE_LOGE(LOG_TAG, "partition NULL!\r\n");
+                    goto Done;
+                }
+
+                memcpy(&m_pOta->m_partition, partition_ptr, sizeof(esp_partition_t));
+                if (esp_ota_begin(&m_pOta->m_partition, OTA_SIZE_UNKNOWN, &m_pOta->m_writeHandle) != ESP_OK) {
+                    NIMBLE_LOGE(LOG_TAG, "esp_ota_begin failed!\r\n");
+                    goto Done;
+                }
+
+                cmd_ack[4] = OTA_ACCEPT;
+                cmd_ack[5] = (OTA_ACCEPT >> 8) & 0xff;
+                m_pOta->setInProgress(true);
+                NIMBLE_LOGI(LOG_TAG, "ota start success");
             }
-        } else {
-            NIMBLE_LOGE(LOG_TAG, "command length error");
+        } else if (cmd == STOP_OTA_CMD) {
+            NIMBLE_LOGI(LOG_TAG, "recv ota stop cmd");
+            if (!m_pOta->isInProgress()) {
+                NIMBLE_LOGE(LOG_TAG, "ota not started");
+            } else {
+                m_pOta->abortOta();
+                cmd_ack[4] = OTA_ACCEPT;
+                cmd_ack[5] = (OTA_ACCEPT >> 8) & 0xff;
+            }
         }
-
-    Done:
-        crc16 = crc16_ccitt(cmd_ack, 18);
-        cmd_ack[18] = crc16;
-        cmd_ack[19] = (crc16 >> 8) & 0xff;
-        pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
-        pCharacteristic->indicate();
+    } else {
+        NIMBLE_LOGE(LOG_TAG, "command length error");
     }
 
-    void onSubscribe(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) override {
-        otaClientInfo = *desc;
-        NIMBLE_LOGI(LOG_TAG, "CMD Subscribe client conn_handle: %d, subscribed: %s", desc->conn_handle, subValue ? "true" : "false");
-        if (!subValue && recv_len < ota_total_len) { // Disconnected, abort
-            NimBLEOta::abortOta();
-        }
+Done:
+    crc16 = crc16_ccitt(cmd_ack, 18);
+    cmd_ack[18] = crc16;
+    cmd_ack[19] = (crc16 >> 8) & 0xff;
+    pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
+    pCharacteristic->indicate();
+}
+
+void NimBLEOta::NimBLEOtaCharacteristicCallbacks::onSubscribe(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) {
+    m_pOta->m_client = *desc;
+    NIMBLE_LOGI(LOG_TAG, "Ota client conn_handle: %d, subscribed: %s", desc->conn_handle, subValue ? "true" : "false");
+    if (!subValue && m_pOta->m_recvLen < m_pOta->m_fileLen) { // Disconnected, abort
+        m_pOta->abortOta();
     }
-};
+}
 
-class CustomerCallbacks : public NimBLECharacteristicCallbacks {
+void NimBLEOta::NimBLEOtaCharacteristicCallbacks::onWrite(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc) {
+    if (pCharacteristic->getUUID().equals(COMMAND_UUID)) {
+        commandOnWrite(pCharacteristic, desc);
+    } else if (pCharacteristic->getUUID().equals(RECV_FW_UUID)) {
+        firmwareOnWrite(pCharacteristic, desc);
+    }
+}
 
-};
-
-NimBLEServer *NimBLEOta::createServer()
-{
+NimBLEServer *NimBLEOta::createServer() {
     NimBLEServer *pServer = NimBLEDevice::createServer();
     NimBLEService *pService = pServer->createService(BLE_OTA_SERVICE_UUID);
 
     /* Receive Firmware Characteristic */
     NimBLECharacteristic *pRecvFwCharacteristic = pService->createCharacteristic(RECV_FW_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-    pRecvFwCharacteristic->setCallbacks(new RecvFwCallbacks());
+    pRecvFwCharacteristic->setCallbacks(&m_charCallbacks);
 
     /* OTA Bar Characteristic */
     NimBLECharacteristic *pOtaBarCharacteristic = pService->createCharacteristic(OTA_BAR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-    pOtaBarCharacteristic->setCallbacks(new OtaBarCallbacks());
+    pOtaBarCharacteristic->setCallbacks(&m_charCallbacks);
 
     /* Command Characteristic */
     NimBLECharacteristic *pCommandCharacteristic = pService->createCharacteristic(COMMAND_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-    pCommandCharacteristic->setCallbacks(new CommandCallbacks());
+    pCommandCharacteristic->setCallbacks(&m_charCallbacks);
 
     /* Customer Characteristic */
     NimBLECharacteristic *pCustomerCharacteristic = pService->createCharacteristic(CUSTOMER_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-    pCustomerCharacteristic->setCallbacks(new CustomerCallbacks());
+    pCustomerCharacteristic->setCallbacks(&m_charCallbacks);
 
     pService->start();
-
     return pServer;
 }
 
-NimBLEUUID NimBLEOta::getServiceUUID()
-{
+NimBLEUUID NimBLEOta::getServiceUUID() const {
     return NimBLEUUID{BLE_OTA_SERVICE_UUID};
 }
 
 void NimBLEOta::abortOta() {
-    if (fw_buf != nullptr) {
-        free(fw_buf);
-        fw_buf = nullptr;
+    if (m_pBuf != nullptr) {
+        free(m_pBuf);
+        m_pBuf = nullptr;
     }
 
-    recv_len = 0;
-    fw_buf_offset = 0;
-    cur_packet = 0;
-    cur_sector = 0;
-    esp_ota_abort(out_handle);
-    ota_started = false;
+    m_recvLen = 0;
+    m_offset = 0;
+    m_packet = 0;
+    m_sector = 0;
+    esp_ota_abort(m_writeHandle);
+    setInProgress(false);
 }
