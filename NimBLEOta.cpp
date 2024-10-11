@@ -46,32 +46,23 @@ static uint16_t crc16_ccitt(const uint8_t *buf, int len) {
 }
 
 void NimBLEOta::NimBLEOtaCharacteristicCallbacks::firmwareOnWrite(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc) {
-    if (ble_addr_cmp(&m_pOta->m_client.peer_id_addr, &desc->peer_id_addr) != 0) {
+    if (!m_pOta->isInProgress()) {
+        NIMBLE_LOGE(LOG_TAG, "ota not started");
+        return;
+    }
+
+    if (NimBLEAddress(desc->peer_id_addr) != NimBLEAddress(m_pOta->m_client.peer_id_addr)) {
         NIMBLE_LOGE(LOG_TAG, "Received write from unknown client - ignored");
         return;
     }
 
     const uint8_t *data = pCharacteristic->getValue();
     auto data_len = pCharacteristic->getValue().length();
-    uint8_t cmd_ack[FW_ACK_LENGTH]{0};
+    uint8_t fw_ack[FW_ACK_LENGTH]{0};
     uint16_t crc16 = 0;
     uint32_t write_len = 0;
-    cmd_ack[0] = data[0];
-    cmd_ack[1] = data[1];
-
-    if (!m_pOta->isInProgress()) {
-        NIMBLE_LOGE(LOG_TAG, "ota not started");
-        cmd_ack[2] = LEN_ERROR;
-        cmd_ack[3] = (LEN_ERROR >> 8) & 0xff;
-        cmd_ack[4] = m_pOta->m_sector;
-        cmd_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
-        crc16 = crc16_ccitt(cmd_ack, 18);
-        cmd_ack[18] = crc16;
-        cmd_ack[19] = (crc16 >> 8) & 0xff;
-        pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
-        pCharacteristic->indicate();
-        return;
-    }
+    fw_ack[0] = data[0];
+    fw_ack[1] = data[1];
 
     if (data[0] + (data[1] * 256) != m_pOta->m_sector) {
         // sector error
@@ -81,14 +72,14 @@ void NimBLEOta::NimBLEOtaCharacteristicCallbacks::firmwareOnWrite(NimBLECharacte
         } else {
             // sector error
             NIMBLE_LOGE(LOG_TAG, "sector index error, cur: %" PRIu32 ", recv: %d", m_pOta->m_sector, (data[0] + (data[1] * 256)));
-            cmd_ack[2] = INDEX_ERROR;
-            cmd_ack[3] = (INDEX_ERROR >> 8) & 0xff;
-            cmd_ack[4] = m_pOta->m_sector;
-            cmd_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
-            crc16 = crc16_ccitt(cmd_ack, 18);
-            cmd_ack[18] = crc16 & 0xff;
-            cmd_ack[19] = (crc16 & 0xff00) >> 8;
-            pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
+            fw_ack[2] = INDEX_ERROR;
+            fw_ack[3] = (INDEX_ERROR >> 8) & 0xff;
+            fw_ack[4] = m_pOta->m_sector;
+            fw_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
+            crc16 = crc16_ccitt(fw_ack, 18);
+            fw_ack[18] = crc16 & 0xff;
+            fw_ack[19] = (crc16 & 0xff00) >> 8;
+            pCharacteristic->setValue(fw_ack, FW_ACK_LENGTH);
             pCharacteristic->indicate();
             return;
         }
@@ -148,14 +139,14 @@ sector_end:
     m_pOta->m_offset = 0;
     memset(m_pOta->m_pBuf, 0x0, OTA_BLOCK_SIZE);
 
-    cmd_ack[2] = OTA_FW_SUCCESS;
-    cmd_ack[3] = (OTA_FW_SUCCESS >> 8) & 0xff;
-    cmd_ack[4] = m_pOta->m_sector;
-    cmd_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
-    crc16 = crc16_ccitt(cmd_ack, 18);
-    cmd_ack[18] = crc16;
-    cmd_ack[19] = (crc16 >> 8) & 0xff;
-    pCharacteristic->setValue(cmd_ack, CMD_ACK_LENGTH);
+    fw_ack[2] = OTA_FW_SUCCESS;
+    fw_ack[3] = (OTA_FW_SUCCESS >> 8) & 0xff;
+    fw_ack[4] = m_pOta->m_sector;
+    fw_ack[5] = (m_pOta->m_sector >> 8) & 0xff;
+    crc16 = crc16_ccitt(fw_ack, 18);
+    fw_ack[18] = crc16;
+    fw_ack[19] = (crc16 >> 8) & 0xff;
+    pCharacteristic->setValue(fw_ack, FW_ACK_LENGTH);
     pCharacteristic->indicate();
     return;
 
@@ -165,7 +156,9 @@ OTA_ERROR:
 }
 
 void NimBLEOta::NimBLEOtaCharacteristicCallbacks::commandOnWrite(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc) {
-    if (ble_addr_cmp(&m_pOta->m_client.peer_id_addr, &desc->peer_id_addr) != 0) {
+    if (NimBLEAddress(m_pOta->m_client.peer_id_addr) == NimBLEAddress("")) {
+        m_pOta->m_client = *desc;
+    } else if (NimBLEAddress(desc->peer_id_addr) != NimBLEAddress(m_pOta->m_client.peer_id_addr)) {
         NIMBLE_LOGE(LOG_TAG, "Received command from unknown client - ignored");
         return;
     }
@@ -186,7 +179,7 @@ void NimBLEOta::NimBLEOtaCharacteristicCallbacks::commandOnWrite(NimBLECharacter
             if (m_pOta->isInProgress()) {
                 NIMBLE_LOGE(LOG_TAG, "ota already started");
             } else {
-                m_pOta->m_fileLen = (data[2]) + (data[3] * 256) + (data[4] * 256 * 256) + (data[5] * 256 * 256 * 256);
+                m_pOta->m_fileLen = *(uint32_t*)(data + 2);
                 NIMBLE_LOGI(LOG_TAG, "recv ota start cmd, fw_length = %" PRIu32 "", m_pOta->m_fileLen);
 
                 m_pOta->m_pBuf = (uint8_t *)malloc(OTA_BLOCK_SIZE * sizeof(uint8_t));
@@ -260,9 +253,9 @@ Done:
 }
 
 void NimBLEOta::NimBLEOtaCharacteristicCallbacks::onSubscribe(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) {
-    m_pOta->m_client = *desc;
     NIMBLE_LOGI(LOG_TAG, "Ota client conn_handle: %d, subscribed: %s", desc->conn_handle, subValue ? "true" : "false");
-    if (!subValue && m_pOta->m_recvLen < m_pOta->m_fileLen) { // Disconnected, abort
+    if (!subValue && m_pOta->m_recvLen < m_pOta->m_fileLen &&
+        NimBLEAddress(m_pOta->m_client.peer_id_addr) == NimBLEAddress(desc->peer_id_addr)) { // Disconnected, abort
         m_pOta->abortOta();
     }
 }
@@ -279,22 +272,21 @@ NimBLEServer *NimBLEOta::createServer() {
     NimBLEServer *pServer = NimBLEDevice::createServer();
     NimBLEService *pService = pServer->createService(BLE_OTA_SERVICE_UUID);
 
-    /* Receive Firmware Characteristic */
     NimBLECharacteristic *pRecvFwCharacteristic = pService->createCharacteristic(RECV_FW_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
     pRecvFwCharacteristic->setCallbacks(&m_charCallbacks);
 
-    /* OTA Bar Characteristic */
-    NimBLECharacteristic *pOtaBarCharacteristic = pService->createCharacteristic(OTA_BAR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-    pOtaBarCharacteristic->setCallbacks(&m_charCallbacks);
-
-    /* Command Characteristic */
     NimBLECharacteristic *pCommandCharacteristic = pService->createCharacteristic(COMMAND_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
     pCommandCharacteristic->setCallbacks(&m_charCallbacks);
 
-    /* Customer Characteristic */
+    /* TODO Customer Characteristic
     NimBLECharacteristic *pCustomerCharacteristic = pService->createCharacteristic(CUSTOMER_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
     pCustomerCharacteristic->setCallbacks(&m_charCallbacks);
+    */
 
+    /* TODO OTA Bar Characteristic
+    NimBLECharacteristic *pOtaBarCharacteristic = pService->createCharacteristic(OTA_BAR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
+    pOtaBarCharacteristic->setCallbacks(&m_charCallbacks);
+    */
     pService->start();
     return pServer;
 }
@@ -313,6 +305,8 @@ void NimBLEOta::abortOta() {
     m_offset = 0;
     m_packet = 0;
     m_sector = 0;
+    m_fileLen = 0;
+    m_client = ble_gap_conn_desc{};
     esp_ota_abort(m_writeHandle);
     setInProgress(false);
 }
