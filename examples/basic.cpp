@@ -21,11 +21,13 @@ void setup()
     Serial.begin(115200);
     NimBLEDevice::init("NIMBLE OTA");
     NimBLEDevice::setMTU(517);
-    NimBLEServer* pServer = bleOta.createServer();
+    NimBLEServer* pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new NimBleOtaServerCallbacks());
+    bleOta.start();
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(bleOta.getServiceUUID());
     pAdvertising->start();
+    Serial.println("NimBLEOta started");
 }
 
 void loop()

@@ -3,19 +3,18 @@
 
 #include "esp_ota_ops.h"
 
-class NimBLEServer;
+class NimBLEService;
 class NimBLECharacteristicCallbacks;
 class NimBLEUUID;
 struct ble_gap_conn_desc;
 
 class NimBLEOta{
 public:
-    NimBLEServer* createServer();
+    NimBLEService* start();
     NimBLEUUID getServiceUUID() const;
-    void abortOta();
-    bool isInProgress() const { return m_inProgess; };
+    void abortUpdate();
+    bool isInProgress() const { return m_inProgress; };
 private:
-    void setInProgress(bool inProgress) { m_inProgess = inProgress; };
     class NimBLEOtaCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     public:
         NimBLEOtaCharacteristicCallbacks(NimBLEOta* pNimBLEOta) : m_pOta(pNimBLEOta) {}
@@ -24,20 +23,21 @@ private:
         void commandOnWrite(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc);
         void firmwareOnWrite(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc);
     private:
+        uint16_t getCrc16(const uint8_t *buf, int len);
         NimBLEOta* m_pOta{nullptr};
     };
 
     NimBLEOta::NimBLEOtaCharacteristicCallbacks m_charCallbacks{this};
-    uint32_t          m_fileLen{};
-    uint8_t*          m_pBuf{nullptr};
-    bool              m_inProgess{false};
-    uint32_t          m_sector{};
-    uint32_t          m_packet{};
-    uint32_t          m_offset{};
-    uint32_t          m_recvLen{};
     ble_gap_conn_desc m_client{};
     esp_ota_handle_t  m_writeHandle{};
     esp_partition_t   m_partition{};
+    uint32_t          m_fileLen{};
+    uint32_t          m_recvLen{};
+    uint8_t*          m_pBuf{nullptr};
+    uint16_t          m_sector{};
+    uint16_t          m_offset{};
+    uint8_t           m_packet{};
+    bool              m_inProgress{false};
 };
 
 #endif // NIMBLE_OTA_H_
