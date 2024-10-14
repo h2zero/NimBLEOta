@@ -1,4 +1,4 @@
-# NimBLE OTA 
+# NimBLE OTA
 
 ``NimBLE Ota`` is based on the ``ble ota component``, it receives firmware via BLE and writes it to flash, sector by sector, until the upgrade is complete.
 
@@ -53,3 +53,5 @@ ACK_Status:
 - 0x0002: Sector_Index error, bytes(4 ~ 5) indicates the desired Sector_Index
 - 0x0003：Payload length error
 
+### WebApp
+Compatible with [BLEOTA_WEBAPP](https://gb88.github.io/BLEOTA/) by @gb88
