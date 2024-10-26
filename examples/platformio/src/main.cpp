@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <NimBLEOta.h>
+#include <NimBLEDis.h>
 
 NimBLEOta bleOta;
+NimBLEDis bleDis;
 
 class NimBleOtaServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *pServer) override {
@@ -71,11 +73,23 @@ void setup() {
     NimBLEDevice::setMTU(517);
     NimBLEServer* pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(&bleOtaServerCallbacks);
+
+    bleDis.init();
+    bleDis.setManufacturerName("NimBLE");
+    bleDis.setModelNumber("NimBLE");
+    bleDis.setFirmwareRevision("1.0");
+    bleDis.setHardwareRevision("1.0");
+    bleDis.setSoftwareRevision("1.0");
+    bleDis.setSystemId("1.0");
+    bleDis.setPnp(0x01, 0x02, 0x03, 0x04);
+    bleDis.start();
+
     bleOta.start(&otaCallbacks);
+
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(bleOta.getServiceUUID());
     pAdvertising->start();
-    Serial.println("NimBLEOta started");
+    Serial.println("OTA service started");
 }
 
 void loop() {
