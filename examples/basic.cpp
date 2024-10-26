@@ -75,12 +75,12 @@ void setup() {
     pServer->setCallbacks(&bleOtaServerCallbacks);
 
     bleDis.init();
-    bleDis.setManufacturerName("NimBLE");
-    bleDis.setModelNumber("NimBLE");
-    bleDis.setFirmwareRevision("1.0");
-    bleDis.setHardwareRevision("1.0");
-    bleDis.setSoftwareRevision("1.0");
-    bleDis.setSystemId("1.0");
+    bleDis.setManufacturerName("NimBLE-DIS");
+    bleDis.setModelNumber("NimBLE-DIS");
+    bleDis.setFirmwareRevision("1.0.0");
+    bleDis.setHardwareRevision("1.0.0");
+    bleDis.setSoftwareRevision("1.0.0");
+    bleDis.setSystemId("1.0.0");
     bleDis.setPnp(0x01, 0x02, 0x03, 0x04);
     bleDis.start();
 
