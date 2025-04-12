@@ -363,7 +363,7 @@ void NimBLEOta::stopAbortTimer() {
 }
 
 void NimBLEOta::abortTimerCb(ble_npl_event* event) {
-    NimBLEOta* pOta = static_cast<NimBLEOta*>(event->arg);
+    NimBLEOta* pOta = static_cast<NimBLEOta*>(ble_npl_event_get_arg(event));
     NIMBLE_LOGW(LOG_TAG, "Abort timer expired: aborting update!");
     pOta->abortUpdate();
 }
