@@ -7,10 +7,8 @@
 
 #include <esp_ota_ops.h>
 #include <NimBLEAddress.h>
+#include <NimBLECharacteristic.h>
 
-class NimBLEService;
-class NimBLECharacteristicCallbacks;
-class NimBLEUUID;
 class NimBLEOtaCallbacks;
 struct ble_npl_callout;
 

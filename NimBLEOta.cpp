@@ -2,8 +2,9 @@
 // Sponsored by Theengs https://www.theengs.io
 // MIT License
 
-#include "NimBLEDevice.h"
 #include "NimBLEOta.h"
+#include "NimBLEDevice.h"
+#include "NimBLELog.h"
 
 #define CMD_ACK_LENGTH 20
 #define FW_ACK_LENGTH  20
